@@ -14,7 +14,7 @@ explanation that the app can show on screen.
 | **Door** | Find each open/close cycle, label it Normal or Abnormal resistance | Time-gap segmentation + motor current relative to the file's own baseline | **0.996** (110/110 on the full stream) | 5-fold × 5 seeds, 110 cycles |
 | **SHM** | Estimate cumulative fatigue damage | Rainflow counting + Miner's rule with two fitted constants | **0.972** (MAPE 2.76%) | leave-one-out, 64 files |
 | **ACV** | Rank the 8 cars by refrigerant-leak likelihood | Cabin temperature relative to the other cars | **0.979** (true car 1st in 5 of 6 cases, 2nd in 1) | all 6 training cases |
-| **Rail** | Normal / Side I / Side II corrugation | 73 vibration features + soft-vote ensemble | **0.84 ± 0.02** macro F1 | 5-fold × 20 seeds, 272 files |
+| **Rail** | Normal / Side I / Side II corrugation | 73 vibration features + soft-vote ensemble | **0.84 ± 0.02** macro F1 (nested: 0.83) | 5-fold × 20 seeds, 272 files |
 
 If these estimates hold, the Overall Score is roughly **0.93–0.95**. ACV (a single
 test file) and Rail (only a handful of Side I files in the test set) are the two
@@ -48,6 +48,8 @@ name and accepted file types, which is enough to build the upload page.
 
 ## The data
 
+All data comes from the organisers' repository; no other data is used or available.
+
 | Subsystem | Files (train / test) | One file is | Used by the model | Labels |
 |---|---|---|---|---|
 | Door | 1 / 1 CSV stream | 50 Hz stream, 17 columns (motor current, voltage, back-EMF, commands, limit switches, door state, leaf position). Train: 18,036 rows, 110 cycles, 70 min. Test: 6,253 rows, 38 cycles | timestamps, motor current, "door is closing" flag | start, end and label per cycle; 27% abnormal |
@@ -73,7 +75,8 @@ name and accepted file types, which is enough to build the upload page.
 - **ACV:** column names are read from each file's own headers, and the one case with a
   different vocabulary is mapped onto the common names. Zero temperature readings are
   treated as dropouts. Masking rows flagged "Invalid" or not in cooling mode was
-  tested and gives the same ranking.
+  tested and gives the same ranking. **Case 04 is incomplete:** cars 05–08 have no
+  cabin temperature readings at all, and cars 01–04 report whole degrees only.
 
 ## How each model works
 
@@ -87,6 +90,8 @@ name and accepted file types, which is enough to build the upload page.
    *in the same file*. Ratio = cycle mean ÷ baseline.
 4. **Decide:** Abnormal resistance if the ratio is ≥ 1.107. That is the midpoint
    between the highest normal (1.074) and the lowest abnormal (1.141) training ratio.
+
+![Door: every cycle's current relative to its own file's baseline](charts/door_ratio_gap.png)
 
 The threshold is relative because current levels shift between doors. Test's closing
 cycles have a median of 464 mA, right on Train's absolute cut-off of 470 mA. The Door
@@ -115,6 +120,8 @@ the formula is rebuilt rather than learned:
 3. Fit `m` and `C` on the 64 training files. For each `m` on a 0.01 grid, `C` is the
    geometric-mean ratio; keep the `m` with the lowest MAPE. Result: **m = 5.03,
    C = 7.98 × 10⁸** (stored in `params_shm.json`).
+
+![SHM: leave-one-out predictions against the true damage](charts/shm_loo_pred_vs_true.png)
 
 Leave-one-out MAPE is 2.76%, which scores 0.972. The fit is sharp in `m`: 2.7% at 5.0,
 but 12–13% at 4.5 or 5.5. By contrast, a simple summary statistic like the standard
@@ -147,8 +154,12 @@ the others under the same weather, time of day and route.
 `detail` reports the margin between the top two cars, with confidence high
 (≥ 0.15 °C), medium (≥ 0.05 °C) or low.
 
+![ACV: each car's temperature relative to the train median, per case](charts/acv_car_scores.png)
+
 On training, the true car ranks 1st in 5 of 6 cases and 2nd in 1 (score 0.979; a
-random ordering scores 0.5625). Expect 0.88–1.00 on a single held-out file.
+random ordering scores 0.5625). Expect 0.88–1.00 on a single held-out file. The one
+miss, case 04, is a data problem rather than a model problem: only cars 01–04 have
+cabin readings in that file, and only in whole degrees.
 
 | Method | c01 | c02 | c03 | c04 | c05 | c06 | Test pick (margin) |
 |---|---|---|---|---|---|---|---|
@@ -221,27 +232,119 @@ All three use balanced class weights to account for the rare fault classes.
 | Symmetric "is this side corrugated?" scorer | 0.42–0.79 |
 | Decision rule tuned inside the folds | +0.012, not adopted |
 
+Feature importance, feature selection and weighting tests are in their own section
+below.
+
 **Caveats:**
 
-- The ensemble was chosen from about 15 configurations, so 0.84 is slightly
-  optimistic. It was confirmed on 10 fresh random splits, beating the previous model
-  on all 10.
 - With 3–4 Side I files expected in the test set, the realised score can move by
   about 0.1 either way.
 - One test file is a genuine toss-up: Test9 is 65% Side II under the old model and
   65% Normal under the new one.
 
-## Validation and honesty notes
+## Validation
 
-- Every score here comes from cross-validation on training data.
+### How each model is validated
+
+Every score comes from cross-validation: the training files are split into a part
+used for fitting and a part used only for testing, repeatedly, so every file is
+tested by a model that never saw it.
+
+| Subsystem | Method | What is fitted inside each training part |
+|---|---|---|
+| Rail | 5 folds (fit on 80%, test on 20%), repeated over 20 random splits | feature scaling, all three models |
+| SHM | leave-one-out: fit on 63 files, test on the 64th, 64 times | `m` and `C` |
+| Door | 5 folds × 5 seeds | the ratio threshold |
+| ACV | nothing is fitted, so every training case is an honest test | — |
+
+**Why not one 80/20 split?** A single 20% test split would hold only about 3 Side I
+files, so the score would swing by about ±0.1 depending on which files landed in it.
+Repeating the split many times gives a stable estimate and a spread. The organisers'
+test set, whose labels they keep, is the final check.
+
+### Overfitting check
+
+| Model | Score on its own training data | Score on held-out data | Verdict |
+|---|---|---|---|
+| SHM (2 constants) | 2.61% error | 2.76% error | no overfitting |
+| Door (1 threshold) | 100% | 99.6% | no overfitting |
+| Rail (ensemble) | 0.99 | **0.84** | fits the training data almost perfectly; 0.84 is the honest figure |
+
+### Nested cross-validation (Rail)
+
+Choosing the best model on the same folds that score it can inflate the score. To
+check, the whole choice was repeated inside each training part: four candidates
+(old gradient boosting, gradient boosting on 73 features, gradient boosting + logistic
+regression, the ensemble) were compared by an inner 4-fold CV, and the winner was
+scored on an outer test fold that the choice never saw. That procedure scores
+**0.834**, against 0.84 for the ensemble, so selection added about 0.01 at most. The
+inner loop picked different winners in different folds (old model 5 times, gradient
+boosting + logistic regression 3, ensemble 2), which shows how close the candidates are
+with about 11 Side I files per fold.
+
+### Honesty notes
+
 - Everything that is fitted (the Door threshold, the SHM constants, the Rail features
-  and model) is fitted inside the training folds only.
+  and model, and any feature selection or weights) is fitted inside the training
+  folds only.
 - Door's relative baseline uses only the test file's own unlabelled readings, which
   are available at prediction time.
 - Selection effects are stated where they exist: ACV was compared against other
-  candidates on its 6 cases, and the Rail ensemble was picked from ~15 configurations.
+  candidates on its 6 cases, and the Rail ensemble was picked from ~15 configurations
+  (the nested check above measures how much that matters).
 - Rail has a speed confound: in training, faults only occur above 35 km/h. A slow
   corrugated section in real service would likely be called Normal.
+
+## Feature importance, selection and weighting (Rail)
+
+### Which features matter
+
+Permutation importance: shuffle one feature in the held-out fold and measure how much
+macro F1 drops (5 folds × 3 seeds).
+
+![Rail: the 15 features the ensemble relies on most](charts/rail_feature_importance.png)
+
+The loudest Side I vibration channel dominates (0.17), followed by the loudest-box
+excess on Side I and the loudest Side II channel. 35 of the 73 features show no drop
+when shuffled on their own, mostly because they overlap with stronger features.
+
+![Rail: how the top 4 features separate the classes](charts/rail_top_features_by_class.png)
+
+### Keeping only the top features
+
+Features were ranked inside each training fold (ranking on all the data first would
+let the test files influence the choice) and only the top *k* were kept.
+
+| Features kept | Macro F1 (5 seeds) |
+|---|---|
+| **All 73 (used)** | **0.846** |
+| Top 15 (F-test / mutual information) | 0.788 / 0.833 |
+| Top 25 | 0.822 / 0.826 |
+| Top 38 | 0.857 / 0.825 (within noise) |
+
+Fewer features never reliably beat all 73. The weak features cost little because
+logistic regression and the SVM already give them small weights.
+
+### Weighting features and models
+
+All weights were chosen inside the training folds and compared on the same splits
+(10 seeds).
+
+| Variant | Macro F1 | vs current |
+|---|---|---|
+| **Current: equal votes, unweighted features** | **0.841 ± 0.021** | — |
+| Feature weights ∝ √(class separation), for SVM and logistic regression | 0.833 | −0.008, worse on 8 of 10 splits |
+| Feature weights ∝ class separation | 0.828 | −0.012, worse on 6 of 10 splits |
+| Tuned vote weights for gradient boosting / SVM / logistic regression | 0.826 ± 0.040 | −0.015, better on 5 and worse on 5 |
+
+Weighting doesn't help. The tuned vote weights changed from fold to fold, a sign they
+were fitting noise, and they doubled the spread. The models already weight features
+themselves: logistic regression learns a weight per feature, the SVM works on
+standardised features, and gradient boosting chooses splits by usefulness.
+
+**Conclusion:** feature sets, model types, ensembles, feature selection and weighting
+were all tested under the same validation, and the equal-weight ensemble on all 73
+features remains the best Rail model.
 
 ## Suggested improvements
 
@@ -256,15 +359,14 @@ All three use balanced class weights to account for the rare fault classes.
 4. **Rail: show uncertainty in the app.** Flag files whose top class probability is
    below ~0.7 (such as Test9) as "needs inspection" instead of giving a hard label.
 5. **ACV: show the setpoint-adjusted margin** as supporting evidence in the
-   explanation, and apply validity and cooling-mode masks when those columns exist.
+   explanation, apply validity and cooling-mode masks when those columns exist, and
+   flag cars with no readings instead of silently ranking them last (as in case 04).
 6. **Door: add a sanity check in the app.** Warn when the current ratios show no clear
    gap, or when more than half of one operation's cycles look abnormal, because that
    is where the 40th-percentile baseline breaks.
 7. **SHM: ask the organisers for their exact rainflow and S-N settings.** The remaining
    2.7% looks like label-side noise. Reporting remaining life (1 − damage) would make
    the output more useful for maintenance planning.
-8. **More data beats more modelling.** Extra Side I files and more ACV cases would
-   improve reliability more than any model change.
 
 ## Retraining
 
@@ -303,4 +405,5 @@ fit_rail.py             refits the Rail ensemble
 make_submissions.py     offline submission generator (format check)
 requirements.txt
 submission/             four formatted CSVs
+charts/                 figures used in this README
 ```
