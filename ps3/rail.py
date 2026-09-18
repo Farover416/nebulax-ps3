@@ -6,10 +6,15 @@ Columns 1-128 are vibration and shock for 64 axle boxes at positions 1-8.
 Odd positions are Side I, even positions are Side II, so the features are
 built per side and the model learns which side is worse.
 
-Measured (5-fold CV x 5 seeds, 272 training files): macro F1 0.81 +- 0.03.
-Per class: Normal 0.977, Side II 0.851, Side I 0.538 -- only 7 of 14 Side I
-files are recalled, and the held-out set likely holds 3-4 of them, so the
-realised score can move +-0.1. Report that range, not a point estimate.
+Model: soft vote of gradient boosting, RBF-SVM and logistic regression
+(make_model) on the 57 side features plus 16 loudest-axle-box features.
+Measured (5-fold CV x 20 seeds, 272 training files): macro F1 0.84 +- 0.02,
+against 0.80 +- 0.04 for the previous single gradient-boosted model on the
+same splits (better on 18 of 20 seeds). Per class: Normal 0.978, Side II
+0.863, Side I 0.676. The ensemble was picked from ~15 configurations on the
+same data, so 0.84 is slightly optimistic, and with only 14 Side I files
+(3-4 expected in the test set) the realised score can move +-0.1. Report
+that range, not a point estimate.
 
 Speed is a weak confound, not a dominant one: speed alone gives macro F1
 0.399 against a 0.33 always-Normal floor, and dropping it costs only 0.02.
@@ -80,7 +85,43 @@ def featurize(path: str) -> pd.Series:
     out = {"speed": v_ms * 3.6}
     for tag, cols in groups.items():
         _side_features(a[:, cols], tag, v_ms, out, freqs)
+    _wheel_features(a, groups, out)
     return pd.Series(out)
+
+
+def _wheel_features(a: np.ndarray, groups: dict, out: dict) -> None:
+    """Loudest-axle-box statistics per side. Corrugation shows up as a few very
+    loud axle boxes on the affected side, which side-averaged features dilute
+    (median-over-wheels contrasts scored 0.46 macro F1 in CV)."""
+    def log_rms(cols):
+        return np.log10(np.sqrt((a[:, cols].astype(np.float64) ** 2).mean(0)) + 1e-9)
+    for kind, (key_i, key_ii) in {"vib": ("I", "II"), "shk": ("sI", "sII")}.items():
+        file_med = np.median(np.concatenate([log_rms(groups[key_i]), log_rms(groups[key_ii])]))
+        for side, key in (("I", key_i), ("II", key_ii)):
+            v = np.sort(log_rms(groups[key]))
+            out[f"{side}_{kind}_wheel_max"] = v[-1]
+            out[f"{side}_{kind}_wheel_top3"] = v[-3:].mean()
+            out[f"{side}_{kind}_wheel_med"] = np.median(v)
+            out[f"{side}_{kind}_wheel_excess"] = v[-1] - file_med
+
+
+def make_model():
+    """Soft vote of three different learners. Averaging their class
+    probabilities was the only change that beat the single gradient-boosted
+    model consistently in cross-validation."""
+    from sklearn.ensemble import HistGradientBoostingClassifier, VotingClassifier
+    from sklearn.impute import SimpleImputer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.svm import SVC
+    return VotingClassifier([
+        ("hgb", HistGradientBoostingClassifier(max_iter=300, class_weight="balanced", random_state=0)),
+        ("svm", make_pipeline(SimpleImputer(strategy="median"), StandardScaler(),
+                              SVC(C=3, class_weight="balanced", probability=True, random_state=0))),
+        ("lr", make_pipeline(SimpleImputer(strategy="median"), StandardScaler(),
+                             LogisticRegression(C=0.1, class_weight="balanced", max_iter=5000))),
+    ], voting="soft")
 
 
 def predict(path: str) -> dict:
