@@ -12,7 +12,7 @@ explanation that the app can show on screen.
 | Subsystem | Task | How it works | CV score | Checked with |
 |---|---|---|---|---|
 | **Door** | Find each open/close cycle, label it Normal or Abnormal resistance | Time-gap segmentation + motor current relative to the file's own baseline | **0.996** (110/110 on the full stream) | 5-fold × 5 seeds, 110 cycles |
-| **SHM** | Estimate cumulative fatigue damage | Rainflow counting + Miner's rule with two fitted constants | **0.972** (MAPE 2.76%) | leave-one-out, 64 files |
+| **SHM** | Estimate cumulative fatigue damage | Ridge regression on rainflow damage sums + signal statistics | **0.977** (MAPE 2.31%) | leave-one-out, 64 files |
 | **ACV** | Rank the 8 cars by refrigerant-leak likelihood | Cabin temperature relative to the other cars | **0.979** (true car 1st in 5 of 6 cases, 2nd in 1) | all 6 training cases |
 | **Rail** | Normal / Side I / Side II corrugation | 73 vibration features + soft-vote ensemble | **0.84 ± 0.02** macro F1 (nested: 0.83) | 5-fold × 20 seeds, 272 files |
 
@@ -45,6 +45,14 @@ shown directly in the app and explains why the prediction was made. Door is the
 exception: it returns `{"segments": DataFrame, "detail": {...}}`, because one file
 contains many door cycles. `predict.SUBSYSTEMS` lists each subsystem's display
 name and accepted file types, which is enough to build the upload page.
+
+The same predictors run from the command line, for one file or a whole folder. This
+writes the CSV in the exact submission format:
+
+```bash
+python -m ps3.predict --subsystem shm  --input SHM/Test --output shm_predictions.csv
+python -m ps3.predict --subsystem door --input Door/Test.csv --output door_predictions.csv
+```
 
 ## The data
 
@@ -110,24 +118,48 @@ cycles are abnormal; beyond that the 40th percentile lands among the abnormal cy
 Train has 27% abnormal cycles and the test predictions 17–25%. On the test file the
 ratios closest to the threshold are 1.072 and 1.204, so no cycle is borderline.
 
-### SHM: physics, not machine learning
+### SHM: machine learning on rainflow physics
 
-The Info Kit states that the labels come from rainflow counting and Miner's rule, so
-the formula is rebuilt rather than learned:
+The Info Kit asks for a regression model that predicts one damage value per file. It
+says the labels were made with rainflow counting and Miner's rule, but that teams
+don't have to use that method. The model uses that physics as its inputs and learns
+the rest from the 64 labelled files:
 
-1. Rainflow-count the stress series. Amplitude = range ÷ 2, and half cycles count 0.5.
-2. `damage = Σ count × amplitude^m / C`
-3. Fit `m` and `C` on the 64 training files. For each `m` on a 0.01 grid, `C` is the
-   geometric-mean ratio; keep the `m` with the lowest MAPE. Result: **m = 5.03,
-   C = 7.98 × 10⁸** (stored in `params_shm.json`).
+1. **Rainflow counting** of the stress series. Amplitude = range ÷ 2, and half cycles
+   count 0.5.
+2. **Features (29):**
+   - 9 rainflow damage sums, log(Σ count × amplitude^m) for m = 3.0, 3.5, …, 7.0, so
+     the model learns how much each amplitude level matters instead of fixing it;
+   - 20 signal statistics: spread, skew, kurtosis, range, 7 percentiles,
+     turning-point rate and 6 spectral band shares.
+3. **Model:** ridge regression on log damage, with standardised features. The
+   regularisation strength is chosen by cross-validation inside each training fold.
+4. **Cross-check:** Miner's rule itself, `damage = Σ count × amplitude^m / C` with
+   fitted m = 5.03 and C = 7.98 × 10⁸ (`params_shm.json`), is computed for every file
+   and shown in `detail` next to the model's answer, along with which amplitude bands
+   drive the damage.
 
-![SHM: leave-one-out predictions against the true damage](charts/shm_loo_pred_vs_true.png)
+![SHM: every training file predicted by a model that never saw it](charts/shm_loo_pred_vs_true.png)
 
-Leave-one-out MAPE is 2.76%, which scores 0.972. The fit is sharp in `m`: 2.7% at 5.0,
-but 12–13% at 4.5 or 5.5. By contrast, a simple summary statistic like the standard
-deviation only reaches R² 0.56, against 0.9989 for the rainflow damage sum.
+| SHM model | Leave-one-out MAPE | Score |
+|---|---|---|
+| ML on signal statistics only: gradient boosting / random forest | 19.0% / 20.4% | 0.81 / 0.80 |
+| ML on signal statistics only: ridge regression | 10.1% | 0.90 |
+| ML on rainflow damage features: gradient boosting / random forest | 8.9% / 5.0% | 0.91 / 0.95 |
+| ML on rainflow damage features: ridge regression | 2.56% | 0.974 |
+| **ML on both: ridge regression (used)** | **2.31%** | **0.977** |
+| Miner's-rule formula, m and C fitted | 2.76% | 0.972 |
 
-Variants tested and ruled out, none of which beats 2.76%:
+The model was picked from these ML configurations, so it was confirmed on 20 repeated
+8-fold splits: 2.37% against 2.72% for the formula, better on all 20, and the worst
+single-file error drops from 13.4% to 6.9%. Tree models do poorly here because 64
+files are too few for them to learn a smooth power law, while ridge regression on log
+damage sums can represent one almost exactly. Signal statistics alone are not enough:
+the standard deviation only reaches R² 0.56 against the labels, while the rainflow
+damage sum reaches 0.9989.
+
+Before moving to the model, these formula variants were tested; none beat the
+formula's 2.76%:
 
 | Variant | Result |
 |---|---|
@@ -135,11 +167,9 @@ Variants tested and ruled out, none of which beats 2.76%:
 | Half cycles counted as full, or dropped | worse |
 | Two-slope S-N curve (knee and both slopes fitted) | 2.81% leave-one-out |
 | Goodman / Gerber mean-stress correction | 3.20% / 2.62% in-sample |
-| Physics + small learned correction (std, damage shares) | 2.82–2.87% leave-one-out |
 
-The remaining ~2.7% isn't explained by counting method, curve shape, mean stress or
-file statistics. Most files are within ±3% and six are 8–15% off with no common
-cause, so it looks like label noise or organiser-side preprocessing.
+The model runs in about 0.5 s per file (581,120 samples), so it also meets the Info
+Kit's call for automated, efficient assessment.
 
 ### ACV: warmest car relative to its neighbours
 
@@ -253,7 +283,7 @@ tested by a model that never saw it.
 | Subsystem | Method | What is fitted inside each training part |
 |---|---|---|
 | Rail | 5 folds (fit on 80%, test on 20%), repeated over 20 random splits | feature scaling, all three models |
-| SHM | leave-one-out: fit on 63 files, test on the 64th, 64 times | `m` and `C` |
+| SHM | leave-one-out: fit on 63 files, test on the 64th, 64 times | feature scaling, ridge regression and its regularisation |
 | Door | 5 folds × 5 seeds | the ratio threshold |
 | ACV | nothing is fitted, so every training case is an honest test | — |
 
@@ -262,11 +292,31 @@ files, so the score would swing by about ±0.1 depending on which files landed i
 Repeating the split many times gives a stable estimate and a spread. The organisers'
 test set, whose labels they keep, is the final check.
 
+### How the splits were chosen
+
+The spec asks teams to design and justify their own train/validation split, for
+example by operating condition or by file.
+
+- **Rail and SHM: by file.** Each file is a separate recording, and the Info Kits say
+  file numbers are assigned at random. No run, line or load-condition labels are
+  provided (SHM mentions two lines and two load conditions, but files aren't tagged
+  with them), so the file is the finest grouping available. Rail folds are stratified
+  by class so every fold contains Side I and Side II files.
+- **Door: by cycle.** There is only one training stream, so cycles are the units. The
+  threshold is fitted on the training folds. The per-file baseline uses only unlabelled
+  current readings, which are also available for a new test file.
+- **ACV: by case.** Each case is a different train, and nothing is fitted, so each case
+  is its own test.
+
+**Assumption:** if several files come from the same run or the same stretch of track,
+cross-validation by file could be slightly optimistic. The data gives no way to check
+this, so it is stated here rather than ignored.
+
 ### Overfitting check
 
 | Model | Score on its own training data | Score on held-out data | Verdict |
 |---|---|---|---|
-| SHM (2 constants) | 2.61% error | 2.76% error | no overfitting |
+| SHM (ridge regression) | 1.57% error | 2.31% error | small gap, no overfitting |
 | Door (1 threshold) | 100% | 99.6% | no overfitting |
 | Rail (ensemble) | 0.99 | **0.84** | fits the training data almost perfectly; 0.84 is the honest figure |
 
@@ -284,14 +334,15 @@ with about 11 Side I files per fold.
 
 ### Honesty notes
 
-- Everything that is fitted (the Door threshold, the SHM constants, the Rail features
+- Everything that is fitted (the Door threshold, the SHM model, the Rail features
   and model, and any feature selection or weights) is fitted inside the training
   folds only.
 - Door's relative baseline uses only the test file's own unlabelled readings, which
   are available at prediction time.
 - Selection effects are stated where they exist: ACV was compared against other
-  candidates on its 6 cases, and the Rail ensemble was picked from ~15 configurations
-  (the nested check above measures how much that matters).
+  candidates on its 6 cases, the Rail ensemble was picked from ~15 configurations
+  (the nested check above measures how much that matters), and the SHM model from 7
+  (confirmed on 20 repeated splits).
 - Rail has a speed confound: in training, faults only occur above 35 km/h. A slow
   corrugated section in real service would likely be called Normal.
 
@@ -348,8 +399,8 @@ features remains the best Rail model.
 
 ## Suggested improvements
 
-1. **Pin `scikit-learn==1.8.0`** in `requirements.txt`, since the Rail model was saved
-   with it.
+1. **Pin `scikit-learn==1.8.0`** in `requirements.txt`, since the Rail and SHM models
+   were saved with it.
 2. **Rail: time-localised features.** In a 1-second window, corrugation may sit under
    only a few wheels. Loudness peaks or impact counts in short windows (50–100 ms) per
    axle box could sharpen the signal.
@@ -364,9 +415,9 @@ features remains the best Rail model.
 6. **Door: add a sanity check in the app.** Warn when the current ratios show no clear
    gap, or when more than half of one operation's cycles look abnormal, because that
    is where the 40th-percentile baseline breaks.
-7. **SHM: ask the organisers for their exact rainflow and S-N settings.** The remaining
-   2.7% looks like label-side noise. Reporting remaining life (1 − damage) would make
-   the output more useful for maintenance planning.
+7. **SHM: report remaining life.** Showing 1 − damage, or how many similar segments
+   the component can take before damage reaches 1, would make the output more useful
+   for maintenance planning.
 
 ## Retraining
 
@@ -377,7 +428,9 @@ python fit_shm.py  <SHM/Train dir>  <SHM/Train_Labels.csv>
 python fit_rail.py <Rail_Corrugation/Train dir> <Rail_Corrugation/Train_Labels.csv>
 ```
 
-`fit_rail.py` takes a few minutes for 272 files and caches features to
+`fit_shm.py` fits the ridge model (`ps3/model_shm.joblib`) and the Miner's-rule
+constants used as a cross-check (`ps3/params_shm.json`), and prints the leave-one-out
+MAPE for both. `fit_rail.py` takes a few minutes for 272 files and caches features to
 `rail_feats_v2.pkl`. It prints the cross-validated macro F1 and saves
 `ps3/model_rail.joblib`.
 
@@ -396,11 +449,12 @@ the predictions demonstrably come from the app itself.
 ```
 ps3/
     __init__.py
-    predict.py          entry point: predict.run(subsystem, path)
+    predict.py          entry point: predict.run(subsystem, path), and the command line
     door.py  shm.py  acv.py  rail.py
-    params_shm.json     fitted m and C
-    model_rail.joblib   the only trained model (soft-vote ensemble)
-fit_shm.py              refits m and C
+    model_shm.joblib    SHM model (ridge regression)
+    params_shm.json     Miner's-rule m and C (cross-check shown in the app)
+    model_rail.joblib   Rail model (soft-vote ensemble)
+fit_shm.py              refits the SHM model and m, C
 fit_rail.py             refits the Rail ensemble
 make_submissions.py     offline submission generator (format check)
 requirements.txt
