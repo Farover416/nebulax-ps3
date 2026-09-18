@@ -1,11 +1,11 @@
 """SHM: cumulative fatigue damage from a dynamic stress time series.
 
 Model: ridge regression on log damage, trained on the 64 labelled files.
-Features (29), computed per file:
+Features (30), computed per file:
   - 9 rainflow damage sums  log( sum_i n_i * amp_i^m )  for m = 3.0, 3.5 ... 7.0,
     so the model learns the S-N weighting from the data instead of it being fixed;
-  - 20 signal statistics (spread, shape, percentiles, turning-point rate,
-    spectral band shares).
+  - 21 signal statistics (mean, spread, shape, range, percentiles, step size,
+    turning-point rate, spectral band shares).
 
 Leave-one-out MAPE across all 64 files: 2.31% (score 0.977), against 2.76% for
 the fitted Miner's-rule formula D = sum(n * amp^m) / C (m = 5.03, C = 7.98e8)
@@ -59,7 +59,7 @@ def damage_sum(c: np.ndarray, m: float) -> float:
 
 
 def features(x: np.ndarray, c: np.ndarray) -> pd.Series:
-    """The 29 model inputs for one stress series and its rainflow cycles."""
+    """The 30 model inputs for one stress series and its rainflow cycles."""
     from scipy import signal, stats
     out = {f"rf_logdmg_m{m:.1f}": np.log(damage_sum(c, m)) for m in DAMAGE_EXPONENTS}
     d = np.diff(x)

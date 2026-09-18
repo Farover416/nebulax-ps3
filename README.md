@@ -127,11 +127,11 @@ the rest from the 64 labelled files:
 
 1. **Rainflow counting** of the stress series. Amplitude = range ÷ 2, and half cycles
    count 0.5.
-2. **Features (29):**
+2. **Features (30):**
    - 9 rainflow damage sums, log(Σ count × amplitude^m) for m = 3.0, 3.5, …, 7.0, so
      the model learns how much each amplitude level matters instead of fixing it;
-   - 20 signal statistics: spread, skew, kurtosis, range, 7 percentiles,
-     turning-point rate and 6 spectral band shares.
+   - 21 signal statistics: mean, spread, skew, kurtosis, range, 7 percentiles, 2
+     step-size measures, turning-point rate and 6 spectral band shares.
 3. **Model:** ridge regression on log damage, with standardised features. The
    regularisation strength is chosen by cross-validation inside each training fold.
 4. **Cross-check:** Miner's rule itself, `damage = Σ count × amplitude^m / C` with
